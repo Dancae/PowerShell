@@ -1,0 +1,174 @@
+function Remove-HKURegistryKey {
+<#
+.Synopsis
+    Removes specified registry key(s) from HKEY_USERS
+.DESCRIPTION
+#>
+    [CmdletBinding()]
+    param (
+        # Registry keys expected in the specific format
+        # Registry keys Example: Software\Microsoft\Windows\CurrentVersion\Uninstall\ApplicationName
+        [Parameter(Mandatory)]
+        [ValidateScript({
+                        if ($_ -match 'HKEY_CLASSES_ROOT'){throw "Please do not enter HKEY_CLASSES_ROOT"}
+                        elseif ($_ -match 'HKEY_CURRENT_USER'){throw "Please do not enter HKEY_CURRENT_USER"}
+                        elseif ($_ -match 'HKEY_LOCAL_MACHINE'){throw "Please do not enter HKEY_LOCAL_MACHINE"}
+                        elseif ($_ -match 'HKEY_USERS'){throw "Please do not enter HKEY_USERS"}
+                        elseif ($_ -match 'HKEY_CURRENT_CONFIG'){throw "Please do not enter HKEY_CURRENT_CONFIG"}
+                        elseif ($_ -match 'HKLM:\\'){throw "Please do not enter HKLM:"}
+                        elseif ($_ -match 'HKCU:\\'){throw "Please do not enter HKCU:"}
+                        elseif ($_ -match 'HKU:\\'){throw "Please do not enter HKU:"}
+                        elseif ($_ -match '/'){throw "Registry can not contain / symbol"}
+                        elseif ($_ -match '`'){throw "Registry can not contain tik symbol"}
+                        elseif ($_ -match '@'){throw "Registry can not contain @ symbol"}
+                        elseif ($_ -match '#'){throw "Registry can not contain # symbol"}
+                        elseif ($_ -match '%'){throw "Registry can not contain % symbol"}
+                        elseif ($_ -match '&'){throw "Registry can not contain & symbol"}
+                        elseif ($_ -match '\*'){throw "Registry can not contain * symbol"}
+                        elseif ($_ -match '\$'){throw "Registry can not contain $ symbol"}
+                        else {$true}
+        })]
+        [ValidateNotNullOrEmpty()]
+        [String]$RegistryKeys
+    )
+
+    begin {
+        [bool]$HKUWasCreated = $false
+        [bool]$CriticalError = $false
+        $RegistryKeysArray = @()
+        $RegistryKeysArray += $RegistryKeys -split '; '
+        # Regex pattern for SIDs
+        $PatternSID = '^S-1-5-21-\d{3,10}-\d{3,10}-\d{3,10}-\d+$'
+        $HKUObjectArray = @()
+    }
+    process {
+        # Create PSDrive HKU
+        if ((Get-PSDrive -Name HKU -ErrorAction SilentlyContinue).Root -eq 'HKEY_USERS'){
+            Write-Verbose -Message 'HKU PSProvider already exists'
+        }
+        else {
+            Write-Verbose -Message 'HKU PSProvider does not exist, trying to create'
+            try {
+                $null = New-PSDrive -PSProvider Registry -Name HKU -Root HKEY_USERS -ErrorAction Stop
+                $HKUWasCreated = $true
+            }
+            catch {
+                Write-Warning -Message 'Error: Failed to create HKU PSProvider'
+                $CriticalError = $true
+                return
+            }
+        }
+
+        # Get Username, SID, and location of ntuser.dat for all users
+        $ProfileList = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*' |
+            Where-Object {$_.PSChildName -match $PatternSID} | 
+            Select-Object -Property @{name='SID';expression={$_.PSChildName}}, 
+                                    @{name='UserHive';expression={"$($_.ProfileImagePath)\ntuser.dat"}}, 
+                                    @{name='Username';expression={$_.ProfileImagePath -replace '^(.*[\\\/])', ''}}
+        if (!$ProfileList){
+            Write-Warning -Message 'No profiles found, matching RegEx:^S-1-5-21-\d{3,10}-\d{3,10}-\d{3,10}-\d+$'
+            $CriticalError = $true
+            return
+        }
+
+        # Get all user SIDs found in HKEY_USERS (ntuder.dat files that are loaded)
+        $LoadedHives = Get-ChildItem -Path Registry::HKEY_USERS |
+            Where-Object {$_.PSChildname -match $PatternSID} |
+            Select-Object -Property @{name='SID';expression={$_.PSChildName}}
+
+        # Get all users that are not currently logged
+        $UnloadedHives = Compare-Object -ReferenceObject $ProfileList.SID -DifferenceObject $LoadedHives.SID |
+            Select-Object -Property @{name='SID';expression={$_.InputObject}}, UserHive, Username
+        # Loop through each profile on the machine
+        foreach ($Item in $ProfileList){
+            # Load User ntuser.dat if it's not already loaded
+            if ($Item.SID -in $UnloadedHives.SID){
+                try {
+                    $RegExe = Start-Process -FilePath "$env:windir\System32\reg.exe" -ArgumentList "LOAD HKU\TEMP_$($Item.SID) $($Item.UserHive)" -PassThru -ErrorAction Stop -Wait
+                }
+                catch {
+                    Write-Warning -Message "Failed to Load $($Item.SID) to registry. Continue cleanup."
+                    continue
+                }
+                if ($RegExe.ExitCode -ne 0){
+                    Write-Warning -Message "Failed to Load $($Item.SID) to registry. Continue cleanup."
+                    continue
+                }
+            }
+
+            # Loop through each RegistryKey inside for Each User
+            foreach ($RegistryKey in $RegistryKeysArray){
+                # Build User Keys.
+                # If SID was loaded, key will be with TEMP_ prefix, else without.
+                if ($Item.SID -in $UnloadedHives.SID){
+                    $RegistryKey = Join-Path -Path "HKU:\TEMP_$($Item.SID)\" -ChildPath $RegistryKey
+                }
+                else {
+                    $RegistryKey = Join-Path -Path "HKU:\$($Item.SID)\" -ChildPath $RegistryKey
+                }   
+                if (Test-Path -Path $RegistryKey){
+                    # REMOVE REGISTRY KEY IN (LOADED) USER HIVE
+                    try {
+                        $null = Remove-Item -Path $RegistryKey -Recurse -Force -ErrorAction Stop
+                        if (!(Test-Path -Path $RegistryKey)){
+                            Write-Verbose -Message "$RegistryKey deleted successfully."
+                        }
+                        else {throw 'FAILED to delete'}
+                        $HKUObject = [pscustomobject]@{
+                                                        RegistryKey = $RegistryKey
+                                                        Success = $true
+                                                        SID = $Item.SID
+                                                        }
+                        $HKUObjectArray += $HKUObject
+                    }
+                    catch {
+                        Write-Warning -Message "Failed to remove $RegistryKey"
+                        $HKUObject = [pscustomobject]@{
+                                                        RegistryKey = $RegistryKey
+                                                        Success = $false
+                                                        SID = $Item.SID
+                                                      }
+                        $HKUObjectArray += $HKUObject
+                    }
+                }
+                else {
+                    Write-Verbose -Message "$RegistryKey doesn't exist. Continue cleanup."
+                }
+            }
+            # Unload ntuser.dat        
+            if ($Item.SID -in $UnloadedHives.SID){
+                # Garbage collection and closing of ntuser.dat
+                [gc]::Collect()
+                try {
+                    try {
+                        Stop-Process -Name 'regedit' -Force -ErrorAction SilentlyContinue
+                    }
+                    catch {
+                        Write-Warning -Message 'Process regedit is not runing or failed to stop'
+                    }
+                    $RegExe = Start-Process -FilePath "$env:windir\System32\reg.exe" -ArgumentList "UNLOAD HKU\TEMP_$($Item.SID)" -PassThru -ErrorAction Stop -Wait
+                }
+                catch {
+                    Write-Warning -Message "Failed to Unload $($Item.SID) from registry!"
+                }
+                if ($RegExe.ExitCode -ne 0){
+                    Write-Warning -Message "Failed to Unload $($Item.SID) to registry."
+                }
+            } #if ($Item.SID -in $UnloadedHives.SID)
+        } #foreach ($Item in $ProfileList)
+    } #process
+    end {
+        # Clear created PSDrive
+        if ((Get-PSDrive -Name HKU -ErrorAction SilentlyContinue) -and $HKUWasCreated){
+            $null = Remove-PSDrive -Name HKU -Force -ErrorAction SilentlyContinue
+        }
+        if ($CriticalError){
+            Write-Warning -Message 'Critical Error appeared. Function failed to complete successfully.'
+            return $false
+        }
+        else {
+            Write-Verbose -Message 'Function completed successfully!'
+            return $HKUObjectArray 
+        }
+    } #end
+}
